@@ -21,14 +21,20 @@ type WhatsApp struct {
 	client    *whatsmeow.Client
 	qr        <-chan whatsmeow.QRChannelItem
 
-	mu      sync.Mutex
-	changes chan queue.Link
-	watch   sync.Once
+	mu       sync.Mutex
+	changes  chan queue.Link
+	pending  Snapshot
+	snapWake chan struct{}
+	watch    sync.Once
 }
 
 // NewWhatsApp pairs through the Session file at path.
 func NewWhatsApp(path string) *WhatsApp {
-	return &WhatsApp{path: path}
+	return &WhatsApp{
+		path:     path,
+		changes:  make(chan queue.Link, 1),
+		snapWake: make(chan struct{}, 1),
+	}
 }
 
 // Open connects. A stored Session is AlreadyLinked and does not ask for a QR code.
@@ -42,6 +48,9 @@ func (w *WhatsApp) Open(ctx context.Context) (Status, error) {
 
 	// A dropped socket reconnects. Logout is a later slice.
 	w.client.EnableAutoReconnect = true
+	w.watch.Do(func() {
+		w.client.AddEventHandler(w.onEvent)
+	})
 	if stored {
 		return AlreadyLinked, w.client.ConnectContext(ctx)
 	}
@@ -126,41 +135,68 @@ func (w *WhatsApp) Close() error {
 	return nil
 }
 
-// NextLink reports a dropped socket as reconnecting, then linked when it returns.
-// It does not ask for a QR code.
-func (w *WhatsApp) NextLink(ctx context.Context) (queue.Link, error) {
-	w.watch.Do(func() {
-		w.mu.Lock()
-		w.changes = make(chan queue.Link, 1)
-		w.mu.Unlock()
-		w.client.AddEventHandler(w.onConnection)
-	})
+// ReadySnapshot returns a history snapshot that arrived before the caller asked.
+func (w *WhatsApp) ReadySnapshot() (Snapshot, bool) {
 	w.mu.Lock()
-	changes := w.changes
-	w.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case status := <-changes:
-		return status, nil
+	defer w.mu.Unlock()
+	if w.pending.empty() {
+		return Snapshot{}, false
+	}
+	snap := w.pending
+	w.pending = Snapshot{}
+	return snap, true
+}
+
+// Wait reports a dropped socket, its return, or a snapshot. Neither carries a QR code.
+func (w *WhatsApp) Wait(ctx context.Context) (Happening, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return Happening{}, ctx.Err()
+		case status := <-w.changes:
+			return Happening{Link: status, HasLink: true}, nil
+		case <-w.snapWake:
+			snap, ok := w.ReadySnapshot()
+			if !ok {
+				continue
+			}
+			return Happening{Snapshot: &snap}, nil
+		}
 	}
 }
 
-func (w *WhatsApp) onConnection(evt any) {
+func (w *WhatsApp) onEvent(evt any) {
+	if hs, ok := evt.(*events.HistorySync); ok {
+		w.addSnap(snapshotFromHistory(hs.Data))
+		return
+	}
 	status, ok := linkStatus(evt)
 	if !ok {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.changes == nil {
-		return
-	}
 	select {
 	case <-w.changes:
 	default:
 	}
 	w.changes <- status
+}
+
+func (w *WhatsApp) addSnap(snap Snapshot) {
+	if snap.empty() {
+		return
+	}
+	w.mu.Lock()
+	w.pending.Chats = append(w.pending.Chats, snap.Chats...)
+	w.pending.Contacts = append(w.pending.Contacts, snap.Contacts...)
+	w.pending.Pushes = append(w.pending.Pushes, snap.Pushes...)
+	w.pending.Mappings = append(w.pending.Mappings, snap.Mappings...)
+	w.mu.Unlock()
+	select {
+	case w.snapWake <- struct{}{}:
+	default:
+	}
 }
 
 // linkStatus maps a connection event to a State link.

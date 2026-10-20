@@ -20,9 +20,19 @@ const (
 
 // State is the latest picture the Server has published.
 // QRCode is set only while a code is ready to scan.
+// Chats is newest activity first.
 type State struct {
 	Link   Link
 	QRCode string
+	Chats  []Chat
+}
+
+// Chat is one row in the list. Address is the phone number address when
+// WhatsApp also has a hidden address for the same person.
+type Chat struct {
+	Address  string
+	Name     string
+	Activity int64
 }
 
 // Action is a command from the UI.

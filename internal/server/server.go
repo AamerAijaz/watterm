@@ -27,16 +27,25 @@ type Link interface {
 	Open(ctx context.Context) (Status, error)
 	// NextCode waits for the next QR code. It returns ErrLinked once the Session is stored.
 	NextCode(ctx context.Context) (string, error)
-	// NextLink waits until the connection drops or returns.
-	// A drop is Reconnecting and carries no QR code. The return is Linked.
-	NextLink(ctx context.Context) (queue.Link, error)
+	// ReadySnapshot returns a snapshot that is already waiting.
+	ReadySnapshot() (Snapshot, bool)
+	// Wait blocks until the connection changes or a snapshot arrives.
+	Wait(ctx context.Context) (Happening, error)
 	Close() error
+}
+
+// Happening is a connection change or a snapshot.
+type Happening struct {
+	Link     queue.Link
+	HasLink  bool
+	Snapshot *Snapshot
 }
 
 // Run publishes pairing State until ctx is cancelled.
 // With no Session it publishes Pairing, then each QR code.
-// After a scan, or when a Session is already stored, it publishes Linked and no code.
-func Run(ctx context.Context, end queue.Server, link Link) error {
+// After a scan, or when a Session is already stored, it publishes Linked.
+// The first snapshot is written to the Transcript and included on that state.
+func Run(ctx context.Context, end queue.Server, link Link, chats Transcript) error {
 	status, err := link.Open(ctx)
 	if err != nil && status != AlreadyLinked {
 		return err
@@ -44,7 +53,7 @@ func Run(ctx context.Context, end queue.Server, link Link) error {
 	defer link.Close()
 
 	if status == AlreadyLinked {
-		return publishLinked(ctx, end, link, err)
+		return publishLinked(ctx, end, link, chats, err, false)
 	}
 
 	if err := end.Publish(queue.State{Link: queue.Pairing}); err != nil {
@@ -53,7 +62,7 @@ func Run(ctx context.Context, end queue.Server, link Link) error {
 	for {
 		code, err := link.NextCode(ctx)
 		if errors.Is(err, ErrLinked) {
-			return publishLinked(ctx, end, link, nil)
+			return publishLinked(ctx, end, link, chats, nil, true)
 		}
 		if err != nil {
 			return err
@@ -64,22 +73,57 @@ func Run(ctx context.Context, end queue.Server, link Link) error {
 	}
 }
 
-// publishLinked tells the UI the Session is stored. connectErr is returned after that
-// so a failed dial still counts as linked and does not ask for a QR code.
-// After that, a dropped connection is reconnecting until the socket returns.
-func publishLinked(ctx context.Context, end queue.Server, link Link, connectErr error) error {
-	if err := end.Publish(queue.State{Link: queue.Linked}); err != nil {
+// publishLinked publishes Linked, then returns connectErr.
+// The state is Linked and QRCode is empty when the dial failed.
+// If ReadySnapshot already has a snapshot, fold writes it into the Transcript before that publish.
+// A dropped connection then publishes reconnecting with the same chats and an empty QRCode.
+func publishLinked(ctx context.Context, end queue.Server, link Link, chats Transcript, connectErr error, justPaired bool) error {
+	if chats == nil {
+		chats = noopChats{}
+	}
+	list, err := chats.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if snap, ok := link.ReadySnapshot(); ok {
+		list = fold(list, snap)
+		if err := chats.Save(ctx, list); err != nil {
+			return err
+		}
+	} else if justPaired && len(list) == 0 {
+		ev, err := link.Wait(ctx)
+		if err != nil {
+			return err
+		}
+		if ev.Snapshot != nil {
+			list = fold(list, *ev.Snapshot)
+			if err := chats.Save(ctx, list); err != nil {
+				return err
+			}
+		}
+	}
+	if err := end.Publish(queue.State{Link: queue.Linked, Chats: list}); err != nil {
 		return err
 	}
 	if connectErr != nil {
 		return connectErr
 	}
+	current := queue.Linked
 	for {
-		status, err := link.NextLink(ctx)
+		ev, err := link.Wait(ctx)
 		if err != nil {
 			return err
 		}
-		if err := end.Publish(queue.State{Link: status}); err != nil {
+		if ev.Snapshot != nil {
+			list = fold(list, *ev.Snapshot)
+			if err := chats.Save(ctx, list); err != nil {
+				return err
+			}
+		}
+		if ev.HasLink {
+			current = ev.Link
+		}
+		if err := end.Publish(queue.State{Link: current, Chats: list}); err != nil {
 			return err
 		}
 	}

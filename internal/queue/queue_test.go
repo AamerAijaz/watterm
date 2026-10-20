@@ -2,6 +2,7 @@ package queue_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/AamerAijaz/watterm/internal/queue"
@@ -19,7 +20,7 @@ func TestNextStateReturnsThePublishedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NextState() = %+v, want %+v", got, want)
 	}
 }

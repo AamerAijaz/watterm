@@ -46,12 +46,17 @@ func run() error {
 
 	ui, srv := queue.New()
 	link := server.NewWhatsApp(filepath.Join(dir, "session.db"))
+	transcript, err := server.OpenTranscript(ctx, filepath.Join(dir, "transcript.db"))
+	if err != nil {
+		return err
+	}
+	defer transcript.Close()
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- server.Run(runCtx, srv, link)
+		errCh <- server.Run(runCtx, srv, link, transcript)
 		cancel()
 	}()
 
@@ -91,6 +96,9 @@ func printState(w io.Writer, state queue.State) {
 		if state.QRCode != "" {
 			qrterminal.GenerateHalfBlock(state.QRCode, qrterminal.L, w)
 		}
+	}
+	for _, chat := range state.Chats {
+		fmt.Fprintln(w, chat.Name)
 	}
 }
 

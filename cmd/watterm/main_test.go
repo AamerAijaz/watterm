@@ -63,4 +63,10 @@ func TestPrintState(t *testing.T) {
 	if buf.String() != "\033[H\033[2J\033[3Jreconnecting\n" {
 		t.Fatalf("reconnecting = %q, want reconnecting and no QR", buf.String())
 	}
+
+	buf.Reset()
+	printState(&buf, queue.State{Link: queue.Linked, Chats: []queue.Chat{{Name: "Sam"}, {Name: "Ada Lovelace"}}})
+	if buf.String() != "\033[H\033[2J\033[3Jlinked\nSam\nAda Lovelace\n" {
+		t.Fatalf("list = %q", buf.String())
+	}
 }
