@@ -16,6 +16,8 @@ import (
 	"github.com/AamerAijaz/watterm/internal/server"
 )
 
+var errAlreadyRunning = errors.New("one Companion is already running")
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -34,6 +36,11 @@ func run() error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	release, err := acquire(dir)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	enableVirtualTerminal()
 
@@ -77,6 +84,8 @@ func printState(w io.Writer, state queue.State) {
 	switch state.Link {
 	case queue.Linked:
 		fmt.Fprintln(w, "linked")
+	case queue.Reconnecting:
+		fmt.Fprintln(w, "reconnecting")
 	case queue.Pairing:
 		fmt.Fprintln(w, "pairing")
 		if state.QRCode != "" {
@@ -92,4 +101,26 @@ func enableVirtualTerminal() {
 		return
 	}
 	_ = windows.SetConsoleMode(handle, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+}
+
+// acquire holds an exclusive lock for this app data directory.
+// A second process fails immediately.
+func acquire(dir string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(dir, "companion.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	err = windows.LockFileEx(
+		windows.Handle(f.Fd()),
+		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
+		0, 1, 0, &windows.Overlapped{},
+	)
+	if err != nil {
+		_ = f.Close()
+		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+			return nil, errAlreadyRunning
+		}
+		return nil, err
+	}
+	return func() { _ = f.Close() }, nil
 }

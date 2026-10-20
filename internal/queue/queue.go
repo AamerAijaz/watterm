@@ -15,6 +15,7 @@ type Link int
 const (
 	Pairing Link = iota + 1
 	Linked
+	Reconnecting
 )
 
 // State is the latest picture the Server has published.

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 
+	"github.com/AamerAijaz/watterm/internal/queue"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types/events"
 	_ "modernc.org/sqlite"
 )
 
@@ -17,6 +20,10 @@ type WhatsApp struct {
 	container *sqlstore.Container
 	client    *whatsmeow.Client
 	qr        <-chan whatsmeow.QRChannelItem
+
+	mu      sync.Mutex
+	changes chan queue.Link
+	watch   sync.Once
 }
 
 // NewWhatsApp pairs through the Session file at path.
@@ -33,8 +40,8 @@ func (w *WhatsApp) Open(ctx context.Context) (Status, error) {
 		return 0, err
 	}
 
-	// TODO: Handle Reconnect. Reconnect is a later slice. Leave a dropped socket down.
-	w.client.EnableAutoReconnect = false
+	// A dropped socket reconnects. Logout is a later slice.
+	w.client.EnableAutoReconnect = true
 	if stored {
 		return AlreadyLinked, w.client.ConnectContext(ctx)
 	}
@@ -117,4 +124,55 @@ func (w *WhatsApp) Close() error {
 		return err
 	}
 	return nil
+}
+
+// NextLink reports a dropped socket as reconnecting, then linked when it returns.
+// It does not ask for a QR code.
+func (w *WhatsApp) NextLink(ctx context.Context) (queue.Link, error) {
+	w.watch.Do(func() {
+		w.mu.Lock()
+		w.changes = make(chan queue.Link, 1)
+		w.mu.Unlock()
+		w.client.AddEventHandler(w.onConnection)
+	})
+	w.mu.Lock()
+	changes := w.changes
+	w.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case status := <-changes:
+		return status, nil
+	}
+}
+
+func (w *WhatsApp) onConnection(evt any) {
+	status, ok := linkStatus(evt)
+	if !ok {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.changes == nil {
+		return
+	}
+	select {
+	case <-w.changes:
+	default:
+	}
+	w.changes <- status
+}
+
+// linkStatus maps a connection event to a State link.
+// A keepalive timeout is a dropped network: whatsmeow then disconnects without emitting Disconnected.
+// Logout is not a drop.
+func linkStatus(evt any) (queue.Link, bool) {
+	switch evt.(type) {
+	case *events.Disconnected, *events.KeepAliveTimeout:
+		return queue.Reconnecting, true
+	case *events.Connected, *events.KeepAliveRestored:
+		return queue.Linked, true
+	default:
+		return 0, false
+	}
 }

@@ -27,6 +27,9 @@ type Link interface {
 	Open(ctx context.Context) (Status, error)
 	// NextCode waits for the next QR code. It returns ErrLinked once the Session is stored.
 	NextCode(ctx context.Context) (string, error)
+	// NextLink waits until the connection drops or returns.
+	// A drop is Reconnecting and carries no QR code. The return is Linked.
+	NextLink(ctx context.Context) (queue.Link, error)
 	Close() error
 }
 
@@ -41,7 +44,7 @@ func Run(ctx context.Context, end queue.Server, link Link) error {
 	defer link.Close()
 
 	if status == AlreadyLinked {
-		return publishLinked(ctx, end, err)
+		return publishLinked(ctx, end, link, err)
 	}
 
 	if err := end.Publish(queue.State{Link: queue.Pairing}); err != nil {
@@ -50,7 +53,7 @@ func Run(ctx context.Context, end queue.Server, link Link) error {
 	for {
 		code, err := link.NextCode(ctx)
 		if errors.Is(err, ErrLinked) {
-			return publishLinked(ctx, end, nil)
+			return publishLinked(ctx, end, link, nil)
 		}
 		if err != nil {
 			return err
@@ -63,13 +66,21 @@ func Run(ctx context.Context, end queue.Server, link Link) error {
 
 // publishLinked tells the UI the Session is stored. connectErr is returned after that
 // so a failed dial still counts as linked and does not ask for a QR code.
-func publishLinked(ctx context.Context, end queue.Server, connectErr error) error {
+// After that, a dropped connection is reconnecting until the socket returns.
+func publishLinked(ctx context.Context, end queue.Server, link Link, connectErr error) error {
 	if err := end.Publish(queue.State{Link: queue.Linked}); err != nil {
 		return err
 	}
 	if connectErr != nil {
 		return connectErr
 	}
-	<-ctx.Done()
-	return ctx.Err()
+	for {
+		status, err := link.NextLink(ctx)
+		if err != nil {
+			return err
+		}
+		if err := end.Publish(queue.State{Link: status}); err != nil {
+			return err
+		}
+	}
 }

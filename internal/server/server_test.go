@@ -111,6 +111,9 @@ func (l linkOpen) NextCode(context.Context) (string, error) {
 	return "", errors.New("no code")
 }
 func (l linkOpen) Close() error { return nil }
+func (l linkOpen) NextLink(context.Context) (queue.Link, error) {
+	return 0, errors.New("no link change")
+}
 
 func TestScanStoresTheSessionAndALaterStartIsLinked(t *testing.T) {
 	link := newMemLink()
@@ -157,6 +160,43 @@ func TestScanStoresTheSessionAndALaterStartIsLinked(t *testing.T) {
 	}
 }
 
+func TestDroppedNetworkPublishesReconnectingThenLinked(t *testing.T) {
+	ui, srv := queue.New()
+	link := newMemLink()
+	link.paired = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Run(ctx, srv, link) }()
+
+	got, err := ui.NextState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Link != queue.Linked || got.QRCode != "" {
+		t.Fatalf("before drop = %+v, want linked and no code", got)
+	}
+
+	link.drop()
+	wait, cancelWait := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelWait()
+	got, err = ui.NextState(wait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Link != queue.Reconnecting || got.QRCode != "" {
+		t.Fatalf("after drop = %+v, want reconnecting and no code", got)
+	}
+
+	link.restore()
+	got, err = ui.NextState(wait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Link != queue.Linked || got.QRCode != "" {
+		t.Fatalf("after restore = %+v, want linked and no code", got)
+	}
+}
+
 // countPublish reports when the Server end has accepted want publishes.
 type countPublish struct {
 	queue.Server
@@ -183,12 +223,14 @@ type memLink struct {
 	paired  bool
 	codes   chan string
 	scanned chan struct{}
+	links   chan queue.Link
 }
 
 func newMemLink() *memLink {
 	return &memLink{
 		codes:   make(chan string),
 		scanned: make(chan struct{}),
+		links:   make(chan queue.Link),
 	}
 }
 
@@ -213,6 +255,18 @@ func (m *memLink) NextCode(ctx context.Context) (string, error) {
 }
 
 func (m *memLink) Close() error { return nil }
+
+func (m *memLink) NextLink(ctx context.Context) (queue.Link, error) {
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case status := <-m.links:
+		return status, nil
+	}
+}
+
+func (m *memLink) drop()    { m.links <- queue.Reconnecting }
+func (m *memLink) restore() { m.links <- queue.Linked }
 
 func (m *memLink) code(code string) { m.codes <- code }
 
